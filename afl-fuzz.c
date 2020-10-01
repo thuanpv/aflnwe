@@ -67,6 +67,9 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 
+#include <arpa/inet.h>
+#include <poll.h>
+
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
@@ -333,6 +336,277 @@ enum {
   /* 05 */ FAULT_NOBITS
 };
 
+enum {
+  /* 00 */ PRO_TCP,
+  /* 01 */ PRO_UDP
+};
+
+
+/* add these declarations here so we can call these functions earlier */
+static inline u8 has_new_bits(u8* virgin_map);
+
+/* AFLnwe-specific variables & functions */
+
+u32 server_wait_usecs = 10000;
+u32 poll_wait_msecs = 1;
+u32 socket_timeout_usecs = 1000;
+u8 net_protocol;
+u8* net_ip;
+u32 net_port;
+EXP_ST u8 session_virgin_bits[MAP_SIZE];     /* Regions yet untouched while the SUT is still running */
+EXP_ST u8 *cleanup_script; /* script to clean up the environment of the SUT -- make fuzzing more deterministic */
+
+//flags
+u8 use_net = 0;
+u8 server_wait = 0;
+u8 poll_wait = 0;
+u8 socket_timeout = 0;
+u8 terminate_child = 0;
+
+
+static u64 get_cur_time(void);
+
+/* split a string using a delimiter */
+int str_split(char* a_str, const char* a_delim, char **result, int a_count)
+{
+	char *token;
+	int count = 0;
+
+	/* count number of tokens */
+	/* get the first token */
+	char* tmp1 = strdup(a_str);
+	token = strtok(tmp1, a_delim);
+
+	/* walk through other tokens */
+	while (token != NULL)
+	{
+		count++;
+		token = strtok(NULL, a_delim);
+	}
+
+	if (count != a_count)
+	{
+		return 1;
+	}
+
+	/* split input string, store tokens into result */
+	count = 0;
+	/* get the first token */
+	token = strtok(a_str, a_delim);
+
+	/* walk through other tokens */
+
+	while (token != NULL)
+	{
+		result[count] = token;
+		count++;
+		token = strtok(NULL, a_delim);
+	}
+
+	free(tmp1);
+	return 0;
+}
+
+/* trim spaces and special characters on the right */
+void str_rtrim(char* a_str)
+{
+	char* ptr = a_str;
+	int count = 0;
+	while ((*ptr != '\n') && (*ptr != '\t') && (*ptr != ' ') && (count < strlen(a_str))) {
+		ptr++;
+		count++;
+	}
+	if (count < strlen(a_str)) {
+		*ptr = '\0';
+	}
+}
+
+
+int parse_net_config(u8* net_config, u8* protocol, u8** ip_address, u32* port)
+{
+  char  buf[80];
+  char **tokens;
+  int tokenCount = 3;
+
+  tokens = (char**)malloc(sizeof(char*) * (tokenCount));
+
+  if (strlen(net_config) > 80) return 1;
+
+  strncpy(buf, net_config, strlen(net_config));
+   str_rtrim(buf);
+
+  if (!str_split(buf, "/", tokens, tokenCount))
+  {
+      if (!strcmp(tokens[0], "tcp:")) {
+        *protocol = PRO_TCP;
+      } else if (!strcmp(tokens[0], "udp:")) {
+        *protocol = PRO_UDP;
+      } else return 1;
+
+      //TODO: check the format of this IP address
+      *ip_address = strdup(tokens[1]);
+
+      *port = atoi(tokens[2]);
+      if (*port == 0) return 1;
+  }
+  return 0;
+}
+
+
+char *get_test_case(long *fsize)
+{
+  /* open generated file */
+  s32 fd = out_fd;
+  if (out_file != NULL)
+    fd = open(out_file, O_RDONLY);
+
+  *fsize = lseek(fd, 0, SEEK_END);
+  lseek(fd, 0, SEEK_SET);
+
+  /* allocate buffer to read the file */
+  char *buf = ck_alloc(*fsize);
+  ck_read(fd, buf, *fsize, "input file");
+
+  return buf;
+}
+
+int net_send(int sockfd, struct timeval timeout, char *mem, unsigned int len) {
+  unsigned int byte_count = 0;
+  int n;
+  struct pollfd pfd[1];
+  pfd[0].fd = sockfd;
+  pfd[0].events = POLLOUT;
+  int rv = poll(pfd, 1, 1);
+
+  setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
+  if (rv > 0) {
+    if (pfd[0].revents & POLLOUT) {
+      while (byte_count < len) {
+        usleep(10);
+        n = send(sockfd, &mem[byte_count], len - byte_count, MSG_NOSIGNAL);
+        if (n == 0) return byte_count;
+        if (n == -1) return -1;
+        byte_count += n;
+      }
+    }
+  }
+  return byte_count;
+}
+
+int net_recv(int sockfd, struct timeval timeout, int poll_w, char **response_buf, unsigned int *len) {
+  char temp_buf[1000];
+  int n;
+  struct pollfd pfd[1];
+  pfd[0].fd = sockfd;
+  pfd[0].events = POLLIN;
+  int rv = poll(pfd, 1, poll_w);
+
+  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+  if (rv > 0) {
+    if (pfd[0].revents & POLLIN) {
+      n = recv(sockfd, temp_buf, sizeof(temp_buf), 0);
+      if ((n < 0) && (errno != 11)) {
+        //fprintf(stderr, "\nError no is: %d\n", errno);
+        return 1;
+      }
+      while (n > 0) {
+        usleep(10);
+        *response_buf = (unsigned char *)ck_realloc(*response_buf, *len + n);
+        memcpy(&(*response_buf)[*len], temp_buf, n);
+        *len = *len + n;
+        n = recv(sockfd, temp_buf, sizeof(temp_buf), 0);
+        if ((n < 0) && (errno != 11)) {
+          //fprintf(stderr, "\nError no is: %d\n", errno);
+          return 1;
+        }
+      }
+    }
+  } else if (rv < 0) return 1;
+  return 0;
+}
+
+int send_over_network()
+{
+  int n;
+  struct sockaddr_in serv_addr;
+
+  //Clean up the server if needed
+  if (cleanup_script) system(cleanup_script);
+
+  //Wait a bit for the server initialization
+  usleep(server_wait_usecs);
+
+  //Create a TCP/UDP socket
+  int sockfd = -1;
+  if (net_protocol == PRO_TCP)
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  else if (net_protocol == PRO_UDP)
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+  if (sockfd < 0) {
+    PFATAL("Cannot create a socket");
+  }
+
+  //Set timeout for socket data sending/receiving -- otherwise it causes a big delay
+  //if the server is still alive after processing all the requests
+  struct timeval timeout;
+  timeout.tv_sec = 0;
+  timeout.tv_usec = socket_timeout_usecs;
+  setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
+
+  memset(&serv_addr, '0', sizeof(serv_addr));
+
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_port = htons(net_port);
+  serv_addr.sin_addr.s_addr = inet_addr(net_ip);
+
+  if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+    //If it cannot connect to the server under test
+    //try it again as the server initial startup time is varied
+    for (n=0; n < 1000; n++) {
+      if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) break;
+      usleep(1000);
+    }
+    if (n== 1000) {
+      close(sockfd);
+      return 1;
+    }
+  }
+
+  long buf_size;
+  char *buf = get_test_case(&buf_size);
+  char *response_buf = NULL;
+  int response_buf_size = 0;
+
+  //retrieve early server response if needed
+  if (net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size)) goto HANDLE_RESPONSES;
+
+  //write the requests stored in the generated seed input
+  n = net_send(sockfd, timeout, buf, buf_size);
+
+HANDLE_RESPONSES:
+
+  net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size);
+
+  //wait a bit letting the server to complete its remaing task(s)
+  memset(session_virgin_bits, 255, MAP_SIZE);
+  while(1) {
+    if (has_new_bits(session_virgin_bits) != 2) break;
+  }
+
+  close(sockfd);
+
+  if (terminate_child && (child_pid > 0)) kill(child_pid, SIGTERM);
+
+  //give the server a bit more time to gracefully terminate
+  while(1) {
+    int status = kill(child_pid, 0);
+    if ((status != 0) && (errno == ESRCH)) break;
+  }
+
+  ck_free(buf);
+  return 0;
+}
 
 /* Get unix time in milliseconds */
 
@@ -2405,11 +2679,11 @@ static u8 run_target(char** argv, u32 timeout) {
   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
 
   if (dumb_mode == 1 || no_forkserver) {
-
+    if (use_net) send_over_network();
     if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
 
   } else {
-
+    if (use_net) send_over_network();
     s32 res;
 
     if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
@@ -2457,6 +2731,8 @@ static u8 run_target(char** argv, u32 timeout) {
     kill_signal = WTERMSIG(status);
 
     if (child_timed_out && kill_signal == SIGKILL) return FAULT_TMOUT;
+
+    if (kill_signal == SIGTERM) return FAULT_NONE;
 
     return FAULT_CRASH;
 
@@ -7764,7 +8040,7 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:Kc:")) > 0)
 
     switch (opt) {
 
@@ -7930,6 +8206,45 @@ int main(int argc, char** argv) {
 
         if (!mem_limit_given) mem_limit = MEM_LIMIT_QEMU;
 
+        break;
+
+      case 'N': /* Network configuration */
+        if (use_net) FATAL("Multiple -N options not supported");
+        if (parse_net_config(optarg, &net_protocol, &net_ip, &net_port)) FATAL("Bad syntax used for -N. Check the network setting. [tcp/udp]://127.0.0.1/port");
+
+        use_net = 1;
+        break;
+
+      case 'D': /* waiting time for the server initialization */
+        if (server_wait) FATAL("Multiple -D options not supported");
+
+        if (sscanf(optarg, "%u", &server_wait_usecs) < 1 || optarg[0] == '-') FATAL("Bad syntax used for -D");
+        server_wait = 1;
+        break;
+
+      case 'W': /* polling timeout determining maximum amount of time waited before concluding that no responses are forthcoming*/
+        if (socket_timeout) FATAL("Multiple -W options not supported");
+
+        if (sscanf(optarg, "%u", &poll_wait_msecs) < 1 || optarg[0] == '-') FATAL("Bad syntax used for -W");
+        poll_wait = 1;
+        break;
+
+      case 'w': /* receive/send socket timeout determining time waited for each response */
+        if (socket_timeout) FATAL("Multiple -w options not supported");
+
+        if (sscanf(optarg, "%u", &socket_timeout_usecs) < 1 || optarg[0] == '-') FATAL("Bad syntax used for -w");
+        socket_timeout = 1;
+        break;
+
+      case 'K':
+        if (terminate_child) FATAL("Multiple -K options not supported");
+        terminate_child = 1;
+        break;
+
+      case 'c': /* cleanup script */
+
+        if (cleanup_script) FATAL("Multiple -c options not supported");
+        cleanup_script = optarg;
         break;
 
       default:
